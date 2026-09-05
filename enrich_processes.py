@@ -1,14 +1,97 @@
 #!/usr/bin/env python3
 """
-Helper script to enrich process data with actual OS start times and memory percentages.
+Helper script to enrich process data with actual OS start times, memory percentages
+and — when the process belongs to a container — its container id and name.
 Reads JSON from stdin and outputs enriched JSON to stdout.
 Total GPU memory can be passed via GPU_MEMORY_TOTAL environment variable.
+
+Container attribution needs two things, and degrades gracefully without either:
+  * `pid: host` on this container, so /proc/<pid>/cgroup resolves the host pid;
+  * the Docker socket mounted read-only, to turn the container id into its name.
+With neither, every process simply reports container_id/container_name as null,
+exactly as before this was added.
 """
+import http.client
 import json
+import re
+import socket
 import sys
 import os
 import psutil
 from datetime import datetime
+
+# cgroup v2: "0::/../docker-<64 hex>.scope"; cgroup v1: ".../docker/<64 hex>"
+_CONTAINER_ID_RE = re.compile(r'(?:docker[-/]|containerd.*?[-/])([0-9a-f]{64})')
+
+DOCKER_SOCKET = os.getenv('DOCKER_SOCKET', '/var/run/docker.sock')
+
+# id -> name, memoised for this invocation. The script is re-run once per sample,
+# so this only spares repeat lookups within a single sweep; that is enough to keep
+# the Docker API call count at one per distinct container rather than one per process.
+_container_name_cache = {}
+
+
+class _UnixHTTPConnection(http.client.HTTPConnection):
+    """HTTPConnection over a unix socket — avoids a docker SDK dependency."""
+
+    def __init__(self, socket_path, timeout=2):
+        super().__init__('localhost', timeout=timeout)
+        self._socket_path = socket_path
+
+    def connect(self):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        sock.connect(self._socket_path)
+        self.sock = sock
+
+
+def get_container_id(pid):
+    """Full container id for a pid, or None if it is not in a container.
+
+    Requires `pid: host`; without it /proc/<pid> is this container's own namespace
+    and the lookup simply misses.
+    """
+    try:
+        with open('/proc/%s/cgroup' % pid, 'r') as fh:
+            cgroup = fh.read()
+    except (OSError, ValueError):
+        return None
+    match = _CONTAINER_ID_RE.search(cgroup)
+    return match.group(1) if match else None
+
+
+def get_container_name(container_id):
+    """Resolve a container id to its name via the Docker socket, or None.
+
+    Never raises: if the socket is absent, unreadable or slow, attribution is
+    simply unavailable and the caller falls back to the id.
+    """
+    if container_id in _container_name_cache:
+        return _container_name_cache[container_id]
+
+    name = None
+    conn = None
+    try:
+        conn = _UnixHTTPConnection(DOCKER_SOCKET)
+        conn.request('GET', '/containers/%s/json' % container_id)
+        response = conn.getresponse()
+        if response.status == 200:
+            # Docker returns the name with a leading slash ("/VoiceStudio").
+            name = (json.load(response).get('Name') or '').lstrip('/') or None
+        else:
+            response.read()
+    except Exception:
+        name = None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    _container_name_cache[container_id] = name
+    return name
+
 
 def get_process_start_time(pid):
     """Get the actual OS start time of a process"""
@@ -71,12 +154,19 @@ def enrich_processes(processes_json, gpu_memory_total):
                     process['actual_lifetime_seconds'] = process.get('lifetime_seconds', 0)
                     process['lifetime_formatted'] = format_lifetime(process.get('lifetime_seconds', 0))
             
+            # Attribute the process to its container, so consumers can say
+            # "VoiceStudio is holding 16% of VRAM" rather than naming a binary
+            # path like /opt/conda/bin/python3 that no operator recognises.
+            container_id = get_container_id(pid) if pid else None
+            process['container_id'] = container_id[:12] if container_id else None
+            process['container_name'] = get_container_name(container_id) if container_id else None
+
             # Calculate memory percentage if total GPU memory is provided
             if gpu_memory_total > 0:
                 process_memory = process.get('memory', 0) or 0
                 memory_percent = round((process_memory / gpu_memory_total) * 100, 2)
                 process['memory_percent'] = memory_percent
-        
+
         return json.dumps(processes)
     except Exception as e:
         print(f"Error enriching processes: {e}", file=sys.stderr)
