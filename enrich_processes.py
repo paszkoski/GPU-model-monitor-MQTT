@@ -44,7 +44,22 @@ _container_name_cache = {}
 # answering about an unknown id.
 _docker_unreachable = False
 
-DOCKER_TIMEOUT = float(os.getenv('DOCKER_TIMEOUT', '2'))
+def _float_env(name, default):
+    """Read a float from the environment, falling back on anything unusable.
+
+    Deliberately total: this runs at import, and the caller keeps whatever we print
+    on stdout. A raise here produces an EMPTY stdout — not even "[]" — which blanks
+    the monitor's whole process table. An unset, blank (`- DOCKER_TIMEOUT` as a bare
+    compose pass-through) or non-numeric value must therefore degrade to the default,
+    never crash.
+    """
+    try:
+        return float(os.getenv(name) or default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+DOCKER_TIMEOUT = _float_env('DOCKER_TIMEOUT', 2.0)
 
 
 class _UnixHTTPConnection(http.client.HTTPConnection):
