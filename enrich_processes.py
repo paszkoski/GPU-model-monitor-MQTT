@@ -20,8 +20,14 @@ import os
 import psutil
 from datetime import datetime
 
-# cgroup v2: "0::/../docker-<64 hex>.scope"; cgroup v1: ".../docker/<64 hex>"
-_CONTAINER_ID_RE = re.compile(r'(?:docker[-/]|containerd.*?[-/])([0-9a-f]{64})')
+# cgroup v2: "0::/../docker-<64 hex>.scope"; cgroup v1: ".../docker/<64 hex>";
+# containerd/CRI: ".../cri-containerd-<64 hex>.scope".
+# The leading (?:^|[/-]) matters: unanchored, any path segment merely ENDING in
+# "docker" would match and yield a confident but wrong container id, which is worse
+# than admitting we don't know.
+_CONTAINER_ID_RE = re.compile(
+    r'(?:^|/)(?:[a-z0-9]+-)?(?:docker|containerd)[-/]([0-9a-f]{64})'
+)
 
 DOCKER_SOCKET = os.getenv('DOCKER_SOCKET', '/var/run/docker.sock')
 
@@ -30,11 +36,21 @@ DOCKER_SOCKET = os.getenv('DOCKER_SOCKET', '/var/run/docker.sock')
 # the Docker API call count at one per distinct container rather than one per process.
 _container_name_cache = {}
 
+# Set once the socket itself proves unreachable, so a HUNG (not merely absent) Docker
+# costs one timeout per invocation rather than one per distinct container. Without
+# this, a host with several GPU-sharing containers could spend N x DOCKER_TIMEOUT
+# serially and overrun the sampling interval — starving the data exactly when the
+# host is already unhealthy. A 404 does NOT set this: that is a healthy socket
+# answering about an unknown id.
+_docker_unreachable = False
+
+DOCKER_TIMEOUT = float(os.getenv('DOCKER_TIMEOUT', '2'))
+
 
 class _UnixHTTPConnection(http.client.HTTPConnection):
     """HTTPConnection over a unix socket — avoids a docker SDK dependency."""
 
-    def __init__(self, socket_path, timeout=2):
+    def __init__(self, socket_path, timeout=DOCKER_TIMEOUT):
         super().__init__('localhost', timeout=timeout)
         self._socket_path = socket_path
 
@@ -66,8 +82,13 @@ def get_container_name(container_id):
     Never raises: if the socket is absent, unreadable or slow, attribution is
     simply unavailable and the caller falls back to the id.
     """
+    global _docker_unreachable
+
     if container_id in _container_name_cache:
         return _container_name_cache[container_id]
+    if _docker_unreachable:
+        # Socket already proved unreachable this invocation; don't pay the timeout again.
+        return None
 
     name = None
     conn = None
@@ -79,9 +100,12 @@ def get_container_name(container_id):
             # Docker returns the name with a leading slash ("/VoiceStudio").
             name = (json.load(response).get('Name') or '').lstrip('/') or None
         else:
+            # A non-200 means the socket is healthy and answered — e.g. 404 for an id
+            # that has since exited. Don't mark Docker unreachable for that.
             response.read()
     except Exception:
         name = None
+        _docker_unreachable = True
     finally:
         if conn is not None:
             try:
@@ -157,9 +181,20 @@ def enrich_processes(processes_json, gpu_memory_total):
             # Attribute the process to its container, so consumers can say
             # "VoiceStudio is holding 16% of VRAM" rather than naming a binary
             # path like /opt/conda/bin/python3 that no operator recognises.
-            container_id = get_container_id(pid) if pid else None
-            process['container_id'] = container_id[:12] if container_id else None
-            process['container_name'] = get_container_name(container_id) if container_id else None
+            #
+            # Contained deliberately: the enclosing try/except returns "[]" for the
+            # WHOLE sample, so an unanticipated failure here would blank the process
+            # list rather than merely lose a name. Attribution is the least important
+            # thing this script produces and must never cost the rest of it.
+            try:
+                container_id = get_container_id(pid) if pid else None
+                process['container_id'] = container_id[:12] if container_id else None
+                process['container_name'] = (
+                    get_container_name(container_id) if container_id else None
+                )
+            except Exception:
+                process['container_id'] = None
+                process['container_name'] = None
 
             # Calculate memory percentage if total GPU memory is provided
             if gpu_memory_total > 0:
