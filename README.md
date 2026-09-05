@@ -239,6 +239,7 @@ The following sensors are automatically created in Home Assistant:
   - Current/Max/Average memory usage
   - **Actual OS process start time**
   - Process lifetime (formatted)
+  - **Container id and container name** (when the process belongs to a container)
   - Status
 - **GPU Process History** - Historical process data
 
@@ -278,6 +279,10 @@ automation:
 
 - `./history:/app/history:rw` - Persists SQLite database and historical data
 - `./logs:/app/logs:rw` - Persists application logs
+- `/var/run/docker.sock:/var/run/docker.sock:ro` - **Optional.** Lets the monitor turn a
+  process's container id into its container **name**, so a dashboard can say *"VoiceStudio is
+  using 16% of VRAM"* instead of naming a binary path like `/opt/conda/bin/python3`. Read-only,
+  and entirely optional: without it `container_name` is null and everything else is unchanged.
 
 ### Ports
 
@@ -324,6 +329,16 @@ Data retention:
 ### Process lifetimes resetting
 - Ensure `--pid=host` is set - this allows the container to query actual OS process start times
 - Without host PID mode, lifetimes will be relative to container start time
+
+### Container name is empty / null
+- `container_id` null too? The cgroup lookup needs **`--pid=host`** — without it `/proc/<pid>`
+  is the monitor's own namespace and no host process resolves. This is the same flag process
+  tracking already requires.
+- `container_id` present but `container_name` null? That is the Docker socket: mount
+  `/var/run/docker.sock:/var/run/docker.sock:ro` (see Volumes). Attribution degrades to the id
+  on purpose rather than failing.
+- Both fields are always null for processes that are **not** in a container (e.g. a host
+  process using the GPU directly). That is correct, not an error.
 
 ### MQTT not connecting
 - Verify MQTT broker is accessible from container
