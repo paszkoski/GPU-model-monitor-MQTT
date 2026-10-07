@@ -64,6 +64,26 @@
             font-size: 0.875rem;
         }
 
+        .gpu-tabs {
+            margin-top: 1rem;
+        }
+
+        .gpu-tab {
+            background: var(--bg-card);
+            color: var(--text-secondary);
+            border: 1px solid transparent;
+            padding: 0.5rem 1rem;
+            border-radius: 0.5rem;
+            margin: 0.25rem;
+            font-size: 0.875rem;
+            cursor: pointer;
+        }
+
+        .gpu-tab.active {
+            color: var(--text-primary);
+            border-color: #2196f3;
+        }
+
         .info-badge strong {
             color: var(--primary);
         }
@@ -248,6 +268,7 @@
         <header class="header">
             <h1 id="gpuTitle">GPU Model Monitor</h1>
             <p>Real-time performance metrics with model tracking</p>
+            <div class="gpu-tabs" id="gpuTabs" style="display: none;"></div>
             <div style="margin-top: 1rem;">
                 <span class="info-badge"><strong>Driver:</strong> <span id="driverVersion">--</span></span>
                 <span class="info-badge"><strong>CUDA:</strong> <span id="cudaVersion">--</span></span>
@@ -326,7 +347,7 @@
 
         <!-- Process History -->
         <div class="card">
-            <h2>Process History (Last 100)</h2>
+            <h2>Process History (Most Recent)</h2>
             <div class="filter-container">
                 <input type="text" id="historyFilter" class="filter-input" placeholder="Filter by process name or PID...">
             </div>
@@ -486,6 +507,11 @@
         });
 
         // Global state
+        let gpuList = [];            // [{index, uuid, name}] from gpu_config.json
+        let selectedGpu = parseInt(localStorage.getItem('selectedGpu') || '0', 10);
+        let latestStats = null;      // last gpu_current_stats.json
+        let historyRows = [];        // all GPUs, rows carry gpu_index
+        let allProcessHistory = [];  // all GPUs, rows carry gpu_index
         let currentProcesses = [];
         let processHistory = [];
         let processSortColumn = 'pid';
@@ -680,17 +706,91 @@
             });
         }
 
+        // Rows from before the multi-GPU schema have no gpu_index: treat them as GPU 0
+        function forSelectedGpu(rows) {
+            return (rows || []).filter(r => (r.gpu_index ?? 0) === selectedGpu);
+        }
+
+        function selectedGpuInfo() {
+            return gpuList.find(g => g.index === selectedGpu);
+        }
+
+        function updateTitle() {
+            const gpu = selectedGpuInfo();
+            const name = gpu ? gpu.name : null;
+            const label = gpuList.length > 1 && gpu ? `GPU ${gpu.index}: ${name}` : name;
+            document.getElementById('gpuTitle').textContent = label || 'GPU Model Monitor';
+            document.querySelector('title').textContent = (label || 'GPU') + ' Model Monitor';
+        }
+
+        function renderGpuTabs() {
+            const tabs = document.getElementById('gpuTabs');
+            tabs.style.display = gpuList.length > 1 ? '' : 'none';
+            tabs.innerHTML = '';
+            gpuList.forEach(gpu => {
+                const button = document.createElement('button');
+                button.className = 'gpu-tab' + (gpu.index === selectedGpu ? ' active' : '');
+                button.textContent = `GPU ${gpu.index} · ${gpu.name}`;
+                button.addEventListener('click', () => selectGpu(gpu.index));
+                tabs.appendChild(button);
+            });
+        }
+
+        function selectGpu(index) {
+            selectedGpu = index;
+            localStorage.setItem('selectedGpu', String(index));
+            renderGpuTabs();
+            updateTitle();
+            renderStats();
+            renderChart();
+            renderProcessHistory();
+        }
+
         // Update GPU config
         function updateGPUConfig() {
             fetch('gpu_config.json')
                 .then(response => response.json())
                 .then(config => {
-                    document.getElementById('gpuTitle').textContent = config.gpu_name || 'GPU Model Monitor';
+                    gpuList = config.gpus || [{ index: 0, name: config.gpu_name }];
+                    if (!gpuList.some(g => g.index === selectedGpu)) {
+                        selectedGpu = gpuList[0].index;
+                    }
                     document.getElementById('driverVersion').textContent = config.driver_version || 'Unknown';
                     document.getElementById('cudaVersion').textContent = config.cuda_version || 'Unknown';
-                    document.querySelector('title').textContent = (config.gpu_name || 'GPU') + ' Model Monitor';
+                    renderGpuTabs();
+                    updateTitle();
                 })
                 .catch(error => console.error('Error loading GPU config:', error));
+        }
+
+        // Render the selected GPU's current metrics and processes
+        function renderStats() {
+            const data = latestStats && (latestStats.gpus || []).find(g => g.index === selectedGpu);
+            if (!data) return;
+
+            // Update current metrics with safe defaults
+            const temperature = data.temperature || 0;
+            const utilization = data.utilization || 0;
+            const memory = data.memory || 0;
+            const memoryTotal = data.memory_total || 0;
+            const memoryPercent = data.memory_percent || 0;
+            const power = data.power || 0;
+
+            document.getElementById('temp-value').textContent = `${temperature}°C`;
+            document.getElementById('util-value').textContent = `${utilization}%`;
+            document.getElementById('mem-value').textContent = `${Math.round(memory)} / ${Math.round(memoryTotal)} MB`;
+            document.getElementById('mem-percent-label').textContent = `${formatNumber(memoryPercent)}%`;
+            document.getElementById('power-value').textContent = `${formatNumber(power)} W`;
+
+            // Update gauges
+            updateGaugeColor(temperature, document.getElementById('temp-gauge'), 100);
+            updateGaugeColor(utilization, document.getElementById('util-gauge'), 100);
+            updateGaugeColor(memoryPercent, document.getElementById('mem-gauge'), 100);
+            updateGaugeColor(power, document.getElementById('power-gauge'), 400);
+
+            // Update current processes
+            currentProcesses = Array.isArray(data.current_processes) ? data.current_processes : [];
+            updateProcessTable(document.getElementById('processFilter').value);
         }
 
         // Update current stats
@@ -703,33 +803,27 @@
                     return response.json();
                 })
                 .then(data => {
-                    // Update current metrics with safe defaults
-                    const temperature = data.temperature || 0;
-                    const utilization = data.utilization || 0;
-                    const memory = data.memory || 0;
-                    const memoryTotal = data.memory_total || 0;
-                    const memoryPercent = data.memory_percent || 0;
-                    const power = data.power || 0;
-                    
-                    document.getElementById('temp-value').textContent = `${temperature}°C`;
-                    document.getElementById('util-value').textContent = `${utilization}%`;
-                    document.getElementById('mem-value').textContent = `${Math.round(memory)} / ${Math.round(memoryTotal)} MB`;
-                    document.getElementById('mem-percent-label').textContent = `${formatNumber(memoryPercent)}%`;
-                    document.getElementById('power-value').textContent = `${formatNumber(power)} W`;
-                    
-                    // Update gauges
-                    updateGaugeColor(temperature, document.getElementById('temp-gauge'), 100);
-                    updateGaugeColor(utilization, document.getElementById('util-gauge'), 100);
-                    updateGaugeColor(memoryPercent, document.getElementById('mem-gauge'), 100);
-                    updateGaugeColor(power, document.getElementById('power-gauge'), 400);
-                    
-                    // Update current processes
-                    if (data.current_processes && Array.isArray(data.current_processes)) {
-                        currentProcesses = data.current_processes;
-                        updateProcessTable(document.getElementById('processFilter').value);
-                    }
+                    latestStats = data;
+                    renderStats();
                 })
                 .catch(error => console.error('Error updating stats:', error));
+        }
+
+        // Render the selected GPU's history chart
+        function renderChart() {
+            const data = forSelectedGpu(historyRows);
+
+            // Take last 100 data points for better performance
+            const maxPoints = 100;
+            const startIdx = Math.max(0, data.length - maxPoints);
+            const recentData = data.slice(startIdx);
+
+            chart.data.labels = recentData.map(d => d.timestamp);
+            chart.data.datasets[0].data = recentData.map(d => d.temperature);
+            chart.data.datasets[1].data = recentData.map(d => d.utilization);
+            chart.data.datasets[2].data = recentData.map(d => d.memory);
+            chart.data.datasets[3].data = recentData.map(d => d.power || 0);
+            chart.update('none');
         }
 
         // Update chart
@@ -738,20 +832,15 @@
                 .then(response => response.json())
                 .then(data => {
                     if (!data || data.length === 0) return;
-                    
-                    // Take last 100 data points for better performance
-                    const maxPoints = 100;
-                    const startIdx = Math.max(0, data.length - maxPoints);
-                    const recentData = data.slice(startIdx);
-                    
-                    chart.data.labels = recentData.map(d => d.timestamp);
-                    chart.data.datasets[0].data = recentData.map(d => d.temperature);
-                    chart.data.datasets[1].data = recentData.map(d => d.utilization);
-                    chart.data.datasets[2].data = recentData.map(d => d.memory);
-                    chart.data.datasets[3].data = recentData.map(d => d.power || 0);
-                    chart.update('none');
+                    historyRows = data;
+                    renderChart();
                 })
                 .catch(error => console.error('Error updating chart:', error));
+        }
+
+        function renderProcessHistory() {
+            processHistory = forSelectedGpu(allProcessHistory);
+            updateHistoryTable(document.getElementById('historyFilter').value);
         }
 
         // Update process history
@@ -760,8 +849,8 @@
                 .then(response => response.json())
                 .then(data => {
                     if (Array.isArray(data)) {
-                        processHistory = data;
-                        updateHistoryTable(document.getElementById('historyFilter').value);
+                        allProcessHistory = data;
+                        renderProcessHistory();
                     }
                 })
                 .catch(error => console.error('Error updating process history:', error));

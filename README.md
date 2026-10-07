@@ -7,6 +7,11 @@ A comprehensive Docker-based NVIDIA GPU monitoring solution with enhanced proces
 
 ## Features
 
+- **Multi-GPU Support**
+  - Every NVIDIA GPU in the host is monitored and tracked independently
+  - Dashboard GPU selector, per-GPU history and per-GPU process tracking (the same PID on two GPUs is tracked separately)
+  - One Home Assistant device per GPU
+
 - **Real-time GPU Metrics Monitoring**
   - Temperature, utilization, memory, and power usage
   - Live updating dashboard with interactive charts
@@ -208,8 +213,15 @@ docker run -d \\
      - MQTT_SSL=false  # Set to true if using SSL/TLS
      - MQTT_USERNAME=your_username
      - MQTT_PASSWORD=your_password
-     - MQTT_TOPIC_PREFIX=gpu_monitor  # Topic root; topics become gpu_monitor/<server>/...
+     - MQTT_TOPIC_PREFIX=gpu_monitor  # Topic root; topics become gpu_monitor/<server>/gpu<N>/...
    ```
+
+   > **Multiple GPUs:** every GPU is published under its own subtree,
+   > `gpu_monitor/<server>/gpu<N>/...` (`N` = nvidia-smi index), and appears as its own Home
+   > Assistant device (`GPU Monitor - <server> - GPU <N> - <model>`). Entity unique ids are
+   > `<server>_gpu<N>_<sensor>`. Upgrading from the single-GPU version? Topics and entities change, so
+   > remove the old retained discovery entries/devices in Home Assistant.
+   > Every GPU visible to the container is monitored, so keep `gpus: "all"`.
 
    > **Running on more than one server?** Give each host a unique `SERVER_NAME`. Topics are
    > namespaced as `gpu_monitor/<server>/...` and each host appears as its own Home Assistant

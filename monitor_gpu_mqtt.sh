@@ -11,6 +11,7 @@
 # - Historical data management
 # - SQLite database for persistence
 # - MQTT publishing for Home Assistant integration
+# - Multi-GPU support (every GPU is sampled and tracked independently)
 ###############################################################################
 
 BASE_DIR="/app"
@@ -24,7 +25,9 @@ DEBUG_LOG="$LOG_DIR/debug.log"
 DB_FILE="$HISTORY_DIR/gpu_metrics.db"
 MQTT_PUBLISHER="$BASE_DIR/mqtt_publisher.py"
 INTERVAL=4  # Time between GPU checks (seconds)
-GPU_MEMORY_TOTAL=0  # Total GPU memory in MB (updated during monitoring)
+declare -A GPU_MEM_TOTAL     # Total memory in MB per GPU index (updated during monitoring)
+declare -A GPU_INDEX_BY_UUID # GPU index lookup by UUID (filled at startup)
+GPU_INDEXES=()               # GPU indexes in nvidia-smi order
 
 # Create required directories with proper permissions
 mkdir -p "$LOG_DIR"
@@ -104,25 +107,53 @@ function publish_to_mqtt() {
 }
 
 ###############################################################################
-# Get GPU name, driver version, and CUDA version
+# Get GPU list, driver version, and CUDA version
 ###############################################################################
-GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || echo "GPU")
-DRIVER_VERSION=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || echo "Unknown")
-CUDA_VERSION=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || echo "Unknown")
+
+# Strip leading/trailing whitespace
+trim() {
+    local v="$1"
+    v="${v#"${v%%[![:space:]]*}"}"
+    echo "${v%"${v##*[![:space:]]}"}"
+}
+
+# Return the argument if it is a number, otherwise 0 (nvidia-smi prints N/A or [N/A])
+num_or_zero() {
+    local v
+    v=$(trim "${1//[\[\]]/}")
+    if [[ "$v" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        echo "$v"
+    else
+        echo "0"
+    fi
+}
+
+GPU_LIST_JSON="[]"
+while IFS=',' read -r idx uuid name; do
+    idx=$(trim "$idx"); uuid=$(trim "$uuid"); name=$(trim "$name")
+    [ -z "$idx" ] && continue
+    GPU_INDEXES+=("$idx")
+    GPU_INDEX_BY_UUID["$uuid"]="$idx"
+    GPU_LIST_JSON=$(echo "$GPU_LIST_JSON" | jq -c --argjson i "$idx" --arg u "$uuid" --arg n "$name" '. + [{index: $i, uuid: $u, name: $n}]')
+done < <(nvidia-smi --query-gpu=index,uuid,name --format=csv,noheader 2>/dev/null)
+
+if [ ${#GPU_INDEXES[@]} -eq 0 ]; then
+    GPU_INDEXES=(0)
+    GPU_LIST_JSON='[{"index": 0, "uuid": "", "name": "GPU"}]'
+fi
+
+DRIVER_VERSION=$(trim "$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1)")
+[ -z "$DRIVER_VERSION" ] && DRIVER_VERSION="Unknown"
 
 # Get CUDA version from nvidia-smi output
-CUDA_VERSION_FULL=$(nvidia-smi | grep "CUDA Version" | sed 's/.*CUDA Version: \([0-9.]*\).*/\1/' || echo "Unknown")
+CUDA_VERSION_FULL=$(nvidia-smi 2>/dev/null | grep "CUDA Version" | sed 's/.*CUDA Version: \([0-9.]*\).*/\1/')
+[ -z "$CUDA_VERSION_FULL" ] && CUDA_VERSION_FULL="Unknown"
 
 CONFIG_FILE="$BASE_DIR/gpu_config.json"
 
-# Create config JSON with GPU info
-cat > "$CONFIG_FILE" << EOF
-{
-    "gpu_name": "${GPU_NAME}",
-    "driver_version": "${DRIVER_VERSION}",
-    "cuda_version": "${CUDA_VERSION_FULL}"
-}
-EOF
+# Create config JSON with GPU info (gpu_name kept for the first GPU for older consumers)
+jq -n --argjson gpus "$GPU_LIST_JSON" --arg driver "$DRIVER_VERSION" --arg cuda "$CUDA_VERSION_FULL" \
+    '{gpu_name: $gpus[0].name, gpu_count: ($gpus | length), gpus: $gpus, driver_version: $driver, cuda_version: $cuda}' > "$CONFIG_FILE"
 
 ###############################################################################
 # initialize_database: Creates and initializes the SQLite database
@@ -137,9 +168,10 @@ function initialize_database() {
     fi
     
     # Create SQLite tables and indexes
-    sqlite3 "$DB_FILE" << EOF
+    sqlite3 "$DB_FILE" << SQL
     CREATE TABLE IF NOT EXISTS gpu_metrics (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        gpu_index INTEGER NOT NULL DEFAULT 0,
         timestamp TEXT NOT NULL,
         timestamp_epoch INTEGER NOT NULL,
         temperature REAL NOT NULL,
@@ -148,47 +180,92 @@ function initialize_database() {
         power REAL NOT NULL
     );
     
-    CREATE INDEX IF NOT EXISTS idx_gpu_metrics_timestamp_epoch ON gpu_metrics(timestamp_epoch);
-    
-    -- Table for tracking processes
+    -- Table for tracking processes (one row per GPU + PID)
     CREATE TABLE IF NOT EXISTS gpu_processes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        pid INTEGER NOT NULL UNIQUE,
+        gpu_index INTEGER NOT NULL DEFAULT 0,
+        pid INTEGER NOT NULL,
         process_name TEXT NOT NULL,
         first_seen INTEGER NOT NULL,
         last_seen INTEGER NOT NULL,
         max_memory REAL NOT NULL,
         avg_memory REAL NOT NULL,
-        sample_count INTEGER NOT NULL DEFAULT 1
+        sample_count INTEGER NOT NULL DEFAULT 1,
+        UNIQUE (gpu_index, pid)
     );
-    
-    CREATE INDEX IF NOT EXISTS idx_gpu_processes_pid ON gpu_processes(pid);
-    CREATE INDEX IF NOT EXISTS idx_gpu_processes_last_seen ON gpu_processes(last_seen);
     
     -- Table for process snapshots
     CREATE TABLE IF NOT EXISTS process_snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        gpu_index INTEGER NOT NULL DEFAULT 0,
         timestamp_epoch INTEGER NOT NULL,
         pid INTEGER NOT NULL,
         process_name TEXT NOT NULL,
         memory_usage REAL NOT NULL
     );
-    
-    CREATE INDEX IF NOT EXISTS idx_process_snapshots_timestamp ON process_snapshots(timestamp_epoch);
-    CREATE INDEX IF NOT EXISTS idx_process_snapshots_pid ON process_snapshots(pid);
-EOF
+SQL
     
     if [ $? -ne 0 ]; then
         log_error "Failed to initialize SQLite database"
         return 1
     fi
     
+    migrate_database
+    
+    sqlite3 "$DB_FILE" << SQL
+    CREATE INDEX IF NOT EXISTS idx_gpu_metrics_timestamp_epoch ON gpu_metrics(timestamp_epoch);
+    CREATE INDEX IF NOT EXISTS idx_gpu_metrics_gpu ON gpu_metrics(gpu_index, timestamp_epoch);
+    CREATE INDEX IF NOT EXISTS idx_gpu_processes_pid ON gpu_processes(gpu_index, pid);
+    CREATE INDEX IF NOT EXISTS idx_gpu_processes_last_seen ON gpu_processes(last_seen);
+    CREATE INDEX IF NOT EXISTS idx_process_snapshots_timestamp ON process_snapshots(timestamp_epoch);
+    CREATE INDEX IF NOT EXISTS idx_process_snapshots_pid ON process_snapshots(gpu_index, pid);
+SQL
+    
     log_debug "Database initialized successfully"
     return 0
 }
 
 ###############################################################################
-# update_process_tracking: Track GPU processes
+# migrate_database: Upgrade a single-GPU database (no gpu_index) in place.
+# Existing rows are attributed to GPU 0.
+###############################################################################
+function migrate_database() {
+    local has_col
+    has_col=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM pragma_table_info('gpu_processes') WHERE name='gpu_index';")
+    [ "$has_col" != "0" ] && return 0
+    
+    log_info "Migrating database to multi-GPU schema (existing data is assigned to GPU 0)"
+    sqlite3 "$DB_FILE" << SQL
+    BEGIN;
+    ALTER TABLE gpu_metrics ADD COLUMN gpu_index INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE process_snapshots ADD COLUMN gpu_index INTEGER NOT NULL DEFAULT 0;
+    -- gpu_processes had UNIQUE(pid); rebuild it with UNIQUE(gpu_index, pid)
+    CREATE TABLE gpu_processes_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        gpu_index INTEGER NOT NULL DEFAULT 0,
+        pid INTEGER NOT NULL,
+        process_name TEXT NOT NULL,
+        first_seen INTEGER NOT NULL,
+        last_seen INTEGER NOT NULL,
+        max_memory REAL NOT NULL,
+        avg_memory REAL NOT NULL,
+        sample_count INTEGER NOT NULL DEFAULT 1,
+        UNIQUE (gpu_index, pid)
+    );
+    INSERT INTO gpu_processes_new (pid, process_name, first_seen, last_seen, max_memory, avg_memory, sample_count)
+        SELECT pid, process_name, first_seen, last_seen, max_memory, avg_memory, sample_count FROM gpu_processes;
+    DROP TABLE gpu_processes;
+    ALTER TABLE gpu_processes_new RENAME TO gpu_processes;
+    COMMIT;
+SQL
+    if [ $? -ne 0 ]; then
+        log_error "Database migration failed"
+        return 1
+    fi
+}
+
+###############################################################################
+# update_process_tracking: Track GPU processes on all GPUs
 ###############################################################################
 
 # Helper function to validate PID
@@ -197,17 +274,62 @@ is_valid_pid() {
     [ -n "$pid" ] && [ "$pid" != "N/A" ] && [ "$pid" != "-" ] && [[ "$pid" =~ ^[0-9]+$ ]]
 }
 
+# record_process <gpu_index> <pid> <name> <memory_mb> <timestamp>
+# Inserts a snapshot and updates the running per-process statistics.
+function record_process() {
+    local gpu="$1" pid="$2" name="$3" mem="$4" now="$5"
+    
+    if ! is_valid_pid "$pid"; then
+        log_debug "Invalid PID: $pid, skipping"
+        return 1
+    fi
+    
+    if ! [[ "$gpu" =~ ^[0-9]+$ ]]; then
+        log_debug "Invalid GPU index: $gpu for PID=$pid, skipping"
+        return 1
+    fi
+    
+    if ! [[ "$mem" =~ ^[0-9]+$ ]]; then
+        log_debug "Invalid memory value: $mem, defaulting to 0"
+        mem="0"
+    fi
+    
+    name=$(echo "$name" | sed "s/'/''/g")
+    
+    if sql_result=$(sqlite3 "$DB_FILE" 2>&1 <<SQL
+INSERT INTO process_snapshots (gpu_index, timestamp_epoch, pid, process_name, memory_usage)
+VALUES ($gpu, $now, $pid, '$name', $mem);
+
+INSERT INTO gpu_processes (gpu_index, pid, process_name, first_seen, last_seen, max_memory, avg_memory, sample_count)
+VALUES ($gpu, $pid, '$name', $now, $now, $mem, $mem, 1)
+ON CONFLICT(gpu_index, pid) DO UPDATE SET
+    last_seen = $now,
+    max_memory = MAX(max_memory, $mem),
+    avg_memory = ((avg_memory * sample_count) + $mem) / (sample_count + 1),
+    sample_count = sample_count + 1;
+SQL
+); then
+        log_debug "Successfully inserted/updated process GPU=$gpu PID=$pid"
+        return 0
+    else
+        log_error "Failed to insert process GPU=$gpu PID=$pid: $sql_result"
+        return 1
+    fi
+}
+
 function update_process_tracking() {
     local current_time=$(date +%s)
     local process_count=0
     
     # Cache nvidia-smi outputs to avoid repeated calls
     local smi_output=$(nvidia-smi 2>/dev/null)
-    local compute_apps=$(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits 2>/dev/null)
+    # gpu_uuid is included so processes can be matched to the right GPU
+    local compute_apps=$(nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader,nounits 2>/dev/null)
     
     log_debug "Starting process tracking at timestamp: $current_time"
     
-    # Get current processes using GPU from pmon (captures ALL processes, not just compute apps)
+    # Get current processes using GPU from pmon (captures ALL processes, not just compute apps).
+    # pmon reports every GPU; its first column is the GPU index.
     local pmon_raw=$(nvidia-smi pmon -c 1 2>/dev/null)
     local pmon_output=$(echo "$pmon_raw" | grep -v "^#" | awk 'NF')
     
@@ -237,45 +359,15 @@ function update_process_tracking() {
             
             local gpu=$(echo "$content" | awk '{print $1}')
             local pid=$(echo "$content" | awk '{print $4}')
-            local ptype=$(echo "$content" | awk '{print $5}')
             local process_name=$(echo "$content" | awk '{if (NF > 6) {for(i=6;i<=NF-1;i++) printf "%s ", $i; printf "\n"} else {print $6}}' | sed 's/[[:space:]]*$//')
             local memory=$(echo "$content" | awk '{print $NF}' | sed 's/MiB//')
             
             pid=$(echo "$pid" | tr -d ' ')
             memory=$(echo "$memory" | tr -d ' ')
             
-            log_debug "Parsed nvidia-smi: PID=$pid, Name=$process_name, Mem=$memory"
+            log_debug "Parsed nvidia-smi: GPU=$gpu, PID=$pid, Name=$process_name, Mem=$memory"
             
-            if ! is_valid_pid "$pid"; then
-                log_debug "Invalid PID: $pid, skipping"
-                continue
-            fi
-            
-            if ! [[ "$memory" =~ ^[0-9]+$ ]]; then
-                log_debug "Invalid memory value: $memory, defaulting to 0"
-                memory="0"
-            fi
-            
-            process_name=$(echo "$process_name" | sed "s/'/''/g")
-            
-            if sql_result=$(sqlite3 "$DB_FILE" 2>&1 <<SQL
-INSERT INTO process_snapshots (timestamp_epoch, pid, process_name, memory_usage)
-VALUES ($current_time, $pid, '$process_name', $memory);
-
-INSERT INTO gpu_processes (pid, process_name, first_seen, last_seen, max_memory, avg_memory, sample_count)
-VALUES ($pid, '$process_name', $current_time, $current_time, $memory, $memory, 1)
-ON CONFLICT(pid) DO UPDATE SET
-    last_seen = $current_time,
-    max_memory = MAX(max_memory, $memory),
-    avg_memory = ((avg_memory * sample_count) + $memory) / (sample_count + 1),
-    sample_count = sample_count + 1;
-SQL
-); then
-                process_count=$((process_count + 1))
-                log_debug "Successfully inserted/updated process PID=$pid"
-            else
-                log_error "Failed to insert process PID=$pid: $sql_result"
-            fi
+            record_process "$gpu" "$pid" "$process_name" "$memory" "$current_time" && process_count=$((process_count + 1))
         done < <(echo "$process_lines")
         
         log_debug "Processed $process_count processes from nvidia-smi output"
@@ -294,65 +386,43 @@ SQL
             continue
         fi
         
-        local process_info=$(echo "$compute_apps" | grep -E "^[[:space:]]*${pid}[[:space:]]*,|^${pid}[[:space:]]*,")
+        # Look the process up among compute apps *on this GPU* (the same PID can run on several GPUs)
+        local proc_name="" proc_mem="" app_uuid app_pid app_name app_mem
+        while IFS=',' read -r app_uuid app_pid app_name app_mem; do
+            app_uuid=$(trim "$app_uuid"); app_pid=$(trim "$app_pid")
+            if [ "$app_pid" = "$pid" ] && [ "${GPU_INDEX_BY_UUID[$app_uuid]:-}" = "$gpu_id" ]; then
+                proc_name=$(trim "$app_name")
+                proc_mem=$(trim "$app_mem")
+                break
+            fi
+        done <<< "$compute_apps"
         
-        if [ -n "$process_info" ]; then
-            local proc_pid=$(echo "$process_info" | cut -d',' -f1 | tr -d ' ')
-            local proc_name=$(echo "$process_info" | cut -d',' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-            local proc_mem=$(echo "$process_info" | cut -d',' -f3 | tr -d ' ')
-            log_debug "Found in compute_apps: PID=$proc_pid, Name=$proc_name, Mem=$proc_mem"
+        if [ -n "$proc_name" ]; then
+            log_debug "Found in compute_apps: GPU=$gpu_id, PID=$pid, Name=$proc_name, Mem=$proc_mem"
         else
-            local proc_pid="$pid"
-            local proc_name="$command"
-            local smi_mem=$(echo "$smi_output" | grep -E "^\|.*[[:space:]]${pid}[[:space:]].*MiB" | sed 's/.*[[:space:]]\([0-9]\+\)MiB.*/\1/')
-            local proc_mem="${smi_mem:-0}"
-            log_debug "Not in compute_apps, using pmon: PID=$proc_pid, Name=$proc_name, Mem=$proc_mem"
+            proc_name="$command"
+            proc_mem=$(echo "$smi_output" | grep -E "^\|[[:space:]]+${gpu_id}[[:space:]].*[[:space:]]${pid}[[:space:]].*MiB" | sed 's/.*[[:space:]]\([0-9]\+\)MiB.*/\1/' | head -n1)
+            proc_mem="${proc_mem:-0}"
+            log_debug "Not in compute_apps, using pmon: GPU=$gpu_id, PID=$pid, Name=$proc_name, Mem=$proc_mem"
         fi
         
-        if ! is_valid_pid "$proc_pid"; then
-            log_debug "Invalid processed PID: $proc_pid, skipping"
-            continue
-        fi
-        
-        if ! [[ "$proc_mem" =~ ^[0-9]+$ ]]; then
-            log_debug "Invalid memory value: $proc_mem, defaulting to 0"
-            proc_mem="0"
-        fi
-        
-        proc_name=$(echo "$proc_name" | sed "s/'/''/g")
-        
-        if sql_result=$(sqlite3 "$DB_FILE" 2>&1 <<SQL
-INSERT INTO process_snapshots (timestamp_epoch, pid, process_name, memory_usage)
-VALUES ($current_time, $proc_pid, '$proc_name', $proc_mem);
-
-INSERT INTO gpu_processes (pid, process_name, first_seen, last_seen, max_memory, avg_memory, sample_count)
-VALUES ($proc_pid, '$proc_name', $current_time, $current_time, $proc_mem, $proc_mem, 1)
-ON CONFLICT(pid) DO UPDATE SET
-    last_seen = $current_time,
-    max_memory = MAX(max_memory, $proc_mem),
-    avg_memory = ((avg_memory * sample_count) + $proc_mem) / (sample_count + 1),
-    sample_count = sample_count + 1;
-SQL
-); then
-            process_count=$((process_count + 1))
-            log_debug "Successfully inserted/updated process PID=$proc_pid"
-        else
-            log_error "Failed to insert process PID=$proc_pid: $sql_result"
-        fi
+        record_process "$gpu_id" "$pid" "$proc_name" "$proc_mem" "$current_time" && process_count=$((process_count + 1))
     done < <(echo "$pmon_output")
     
     log_debug "Processed $process_count processes from pmon output"
 }
 
 ###############################################################################
-# get_current_processes: Get current GPU processes as JSON
+# get_current_processes: Get current processes of one GPU as JSON
+# Usage: get_current_processes <gpu_index> <total_memory_mb>
 ###############################################################################
 function get_current_processes() {
-    local mem_total="${1:-0}"
+    local gpu="$1"
+    local mem_total="${2:-0}"
     local current_time=$(date +%s)
     local cutoff_time=$((current_time - 10))
     
-    log_debug "Getting current processes with cutoff_time=$cutoff_time, total_memory=$mem_total"
+    log_debug "Getting current processes for GPU $gpu with cutoff_time=$cutoff_time, total_memory=$mem_total"
     
     if result=$(sqlite3 -json "$DB_FILE" 2>&1 <<SQL
     SELECT 
@@ -369,13 +439,16 @@ function get_current_processes() {
     LEFT JOIN (
         SELECT pid, memory_usage
         FROM process_snapshots
-        WHERE (pid, timestamp_epoch) IN (
+        WHERE gpu_index = $gpu
+          AND (pid, timestamp_epoch) IN (
             SELECT pid, MAX(timestamp_epoch)
             FROM process_snapshots
+            WHERE gpu_index = $gpu
             GROUP BY pid
         )
     ) s ON p.pid = s.pid
-    WHERE p.last_seen > $cutoff_time
+    WHERE p.gpu_index = $gpu
+      AND p.last_seen > $cutoff_time
     ORDER BY p.last_seen DESC;
 SQL
 ); then
@@ -392,36 +465,6 @@ SQL
         echo "$result"
     else
         log_error "Failed to query current processes: $result"
-        echo "[]"
-        return 1
-    fi
-}
-
-###############################################################################
-# get_process_history: Get historical process data as JSON
-###############################################################################
-function get_process_history() {
-    log_debug "Getting process history"
-    
-    if result=$(sqlite3 -json "$DB_FILE" 2>&1 <<SQL
-    SELECT 
-        pid,
-        process_name,
-        datetime(first_seen, 'unixepoch', 'localtime') as first_seen,
-        datetime(last_seen, 'unixepoch', 'localtime') as last_seen,
-        (last_seen - first_seen) as lifetime_seconds,
-        max_memory,
-        avg_memory,
-        sample_count
-    FROM gpu_processes
-    ORDER BY last_seen DESC
-    LIMIT 100;
-SQL
-); then
-        log_debug "Process history query returned: ${result:0:200}..."
-        echo "$result"
-    else
-        log_error "Failed to query process history: $result"
         echo "[]"
         return 1
     fi
@@ -456,70 +499,85 @@ function safe_write_json() {
 update_stats() {
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     local timestamp_epoch=$(date +%s)
-    local gpu_stats=$(nvidia-smi --query-gpu=temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw \
+    local gpu_stats=$(nvidia-smi --query-gpu=index,uuid,name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw \
                      --format=csv,noheader,nounits 2>/dev/null)
     
-    if [[ -n "$gpu_stats" ]]; then
-        local temp=$(echo "$gpu_stats" | cut -d',' -f1 | tr -d ' ')
-        local util=$(echo "$gpu_stats" | cut -d',' -f2 | tr -d ' ')
-        local mem=$(echo "$gpu_stats" | cut -d',' -f3 | tr -d ' ')
-        local mem_total=$(echo "$gpu_stats" | cut -d',' -f4 | tr -d ' ')
-        local power=$(echo "$gpu_stats" | cut -d',' -f5 | tr -d ' []')
+    if [[ -z "$gpu_stats" ]]; then
+        log_error "Failed to get GPU stats output"
+        return
+    fi
+    
+    local gpu_objects=()
+    local gpu_rows=()
+    local idx uuid name temp util mem mem_total power mem_percent
+    
+    while IFS=',' read -r idx uuid name temp util mem mem_total power; do
+        idx=$(trim "$idx")
+        [[ "$idx" =~ ^[0-9]+$ ]] || continue
+        uuid=$(trim "$uuid")
+        name=$(trim "$name")
+        temp=$(num_or_zero "$temp")
+        util=$(num_or_zero "$util")
+        mem=$(num_or_zero "$mem")
+        mem_total=$(num_or_zero "$mem_total")
+        power=$(num_or_zero "$power")
         
-        # Update global GPU_MEMORY_TOTAL
-        GPU_MEMORY_TOTAL="$mem_total"
+        GPU_MEM_TOTAL[$idx]="$mem_total"
         
         # Calculate memory percentage
-        local mem_percent=0
-        if [[ -n "$mem_total" && "$mem_total" -gt 0 ]]; then
+        mem_percent=0
+        if awk "BEGIN {exit !($mem_total > 0)}"; then
             mem_percent=$(awk "BEGIN {printf \"%.1f\", ($mem / $mem_total) * 100}")
-        fi
-
-        # Handle N/A power value
-        if [[ "$power" == "N/A" || -z "$power" || "$power" == "[N/A]" ]]; then
-            power="0"
         fi
         
         # Insert into database
         sqlite3 "$DB_FILE" <<SQL
-        INSERT INTO gpu_metrics (timestamp, timestamp_epoch, temperature, utilization, memory, power)
-        VALUES ('$timestamp', $timestamp_epoch, $temp, $util, $mem, $power);
+        INSERT INTO gpu_metrics (gpu_index, timestamp, timestamp_epoch, temperature, utilization, memory, power)
+        VALUES ($idx, '$timestamp', $timestamp_epoch, $temp, $util, $mem, $power);
 SQL
-        
-        # Update process tracking
-        update_process_tracking
+        gpu_rows+=("$idx|$uuid|$name|$temp|$util|$mem|$mem_total|$mem_percent|$power")
+    done <<< "$gpu_stats"
+    
+    # Update process tracking for all GPUs once per cycle
+    update_process_tracking
+    
+    local row current_processes
+    for row in "${gpu_rows[@]}"; do
+        IFS='|' read -r idx uuid name temp util mem mem_total mem_percent power <<< "$row"
         
         # Get current processes for display (pass total memory for percentage calculation)
-        local current_processes=$(get_current_processes "$mem_total")
+        current_processes=$(get_current_processes "$idx" "$mem_total")
         
         # Ensure current_processes is valid JSON (empty array if no output)
-        if [ -z "$current_processes" ] || [ "$current_processes" = "[]" ]; then
+        if [ -z "$current_processes" ]; then
             current_processes="[]"
         fi
         
-        # Create JSON content with processes
-        local json_content=$(cat << EOF
-{
-    "timestamp": "$timestamp",
-    "temperature": $temp,
-    "utilization": $util,
-    "memory": $mem,
-    "memory_total": $mem_total,
-    "memory_percent": $mem_percent,
-    "power": $power,
-    "current_processes": $current_processes
-}
-EOF
-)
-        
-        # Write JSON safely
-        safe_write_json "$JSON_FILE" "$json_content"
-        
-        # Publish to MQTT if enabled
-        publish_to_mqtt "$JSON_FILE"
-    else
-        log_error "Failed to get GPU stats output"
+        gpu_objects+=("$(jq -n -c \
+            --argjson index "$idx" --arg uuid "$uuid" --arg name "$name" \
+            --argjson temperature "$temp" --argjson utilization "$util" \
+            --argjson memory "$mem" --argjson memory_total "$mem_total" \
+            --argjson memory_percent "$mem_percent" --argjson power "$power" \
+            --argjson current_processes "$current_processes" \
+            '{index: $index, uuid: $uuid, name: $name, temperature: $temperature, utilization: $utilization,
+              memory: $memory, memory_total: $memory_total, memory_percent: $memory_percent,
+              power: $power, current_processes: $current_processes}')")
+    done
+    
+    # Create JSON content: one entry per GPU
+    local json_content
+    json_content=$(printf '%s\n' "${gpu_objects[@]}" | jq -s --arg ts "$timestamp" '{timestamp: $ts, gpus: .}')
+    
+    if [ -z "$json_content" ]; then
+        log_error "Failed to build stats JSON"
+        return
     fi
+    
+    # Write JSON safely
+    safe_write_json "$JSON_FILE" "$json_content"
+    
+    # Publish to MQTT if enabled
+    publish_to_mqtt "$JSON_FILE"
 }
 
 ###############################################################################
@@ -531,6 +589,7 @@ function export_history_json() {
     
     local history_data=$(sqlite3 -json "$DB_FILE" <<SQL
     SELECT 
+        gpu_index,
         timestamp,
         temperature,
         utilization,
@@ -553,30 +612,36 @@ SQL
 function export_process_history_json() {
     local output_file="$HISTORY_DIR/process_history.json"
     
-    # Use global GPU_MEMORY_TOTAL for percentage calculation
-    local mem_total="${GPU_MEMORY_TOTAL:-0}"
+    # Per-GPU total memory, passed to SQL as a lookup table for the percentage calculation
+    local totals="" i
+    for i in "${GPU_INDEXES[@]}"; do
+        totals+="${totals:+,}($i, ${GPU_MEM_TOTAL[$i]:-0})"
+    done
     
     local process_history=$(sqlite3 -json "$DB_FILE" <<SQL
+    WITH totals(gpu_index, total) AS (VALUES $totals)
     SELECT 
-        pid,
-        process_name,
-        datetime(first_seen, 'unixepoch', 'localtime') as first_seen,
-        datetime(last_seen, 'unixepoch', 'localtime') as last_seen,
-        (last_seen - first_seen) as lifetime_seconds,
-        max_memory,
-        avg_memory,
+        p.gpu_index,
+        p.pid,
+        p.process_name,
+        datetime(p.first_seen, 'unixepoch', 'localtime') as first_seen,
+        datetime(p.last_seen, 'unixepoch', 'localtime') as last_seen,
+        (p.last_seen - p.first_seen) as lifetime_seconds,
+        p.max_memory,
+        p.avg_memory,
         CASE 
-            WHEN $mem_total > 0 THEN ROUND((avg_memory / $mem_total) * 100, 2)
+            WHEN COALESCE(t.total, 0) > 0 THEN ROUND((p.avg_memory / t.total) * 100, 2)
             ELSE 0 
         END as avg_memory_percent,
         CASE 
-            WHEN $mem_total > 0 THEN ROUND((max_memory / $mem_total) * 100, 2)
+            WHEN COALESCE(t.total, 0) > 0 THEN ROUND((p.max_memory / t.total) * 100, 2)
             ELSE 0 
         END as max_memory_percent,
-        sample_count
-    FROM gpu_processes
-    ORDER BY last_seen DESC
-    LIMIT 100;
+        p.sample_count
+    FROM gpu_processes p
+    LEFT JOIN totals t ON t.gpu_index = p.gpu_index
+    ORDER BY p.last_seen DESC
+    LIMIT $(( 100 * ${#GPU_INDEXES[@]} ));
 SQL
 )
     
@@ -608,7 +673,8 @@ SQL
 echo "========================================="
 echo "GPU Model Monitor (with MQTT)"
 echo "========================================="
-echo "GPU: $GPU_NAME"
+echo "GPUs: ${#GPU_INDEXES[@]}"
+echo "$GPU_LIST_JSON" | jq -r '.[] | "  GPU \(.index): \(.name)"'
 echo "Driver: $DRIVER_VERSION"
 echo "CUDA: $CUDA_VERSION_FULL"
 echo "========================================="

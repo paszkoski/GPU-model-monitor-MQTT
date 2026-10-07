@@ -45,8 +45,8 @@ class GPUMQTTPublisher:
         topic_root = os.getenv('MQTT_TOPIC_PREFIX', 'gpu_monitor').strip()
         self.mqtt_topic_prefix = f"{topic_root}/{self.server_id}"
         
-        # GPU configuration
-        self.gpu_name = None
+        # GPU configuration (the GPU list itself comes from each metrics snapshot)
+        self.gpus = []
         self.driver_version = None
         self.cuda_version = None
         
@@ -104,21 +104,27 @@ class GPUMQTTPublisher:
             return f"{days}d {remaining_hours}h"
     
     def load_gpu_config(self):
-        """Load GPU configuration from config file"""
+        """Load driver/CUDA versions from config file"""
         config_file = "/app/gpu_config.json"
         try:
             if os.path.exists(config_file):
                 with open(config_file, 'r') as f:
                     config = json.load(f)
-                    self.gpu_name = config.get('gpu_name', 'GPU')
                     self.driver_version = config.get('driver_version', 'Unknown')
                     self.cuda_version = config.get('cuda_version', 'Unknown')
-                    logger.info(f"GPU Config loaded: {self.gpu_name}")
+                    logger.info(f"GPU Config loaded: driver {self.driver_version}, CUDA {self.cuda_version}")
         except Exception as e:
             logger.error(f"Failed to load GPU config: {e}")
-            self.gpu_name = "GPU"
             self.driver_version = "Unknown"
             self.cuda_version = "Unknown"
+
+    def gpu_prefix(self, gpu):
+        """Topic prefix for one GPU: <root>/<server>/gpu<index>"""
+        return f"{self.mqtt_topic_prefix}/gpu{gpu['index']}"
+
+    def gpu_device_id(self, gpu):
+        """Stable per-GPU id for HA devices/entities: <server>_gpu<index>"""
+        return f"{self.server_id}_gpu{gpu['index']}"
     
     def on_connect(self, client, userdata, flags, rc):
         """Callback when connected to MQTT broker"""
@@ -177,19 +183,25 @@ class GPUMQTTPublisher:
     
     def publish_discovery(self):
         """Publish Home Assistant MQTT discovery messages"""
-        if not self.connected or not self.gpu_name:
+        if not self.connected:
             return
-        
-        # Sanitize device name for use in topic, scoped per server so two hosts with the
-        # same GPU model remain distinct Home Assistant devices.
-        gpu_id = self._sanitize(self.gpu_name)
-        device_id = f"{self.server_id}_{gpu_id}"
+        for gpu in self.gpus:
+            self.publish_gpu_discovery(gpu)
+        logger.info(f"Home Assistant discovery messages published for {len(self.gpus)} GPU(s)")
+
+    def publish_gpu_discovery(self, gpu):
+        """Publish discovery messages for a single GPU (one HA device per GPU)"""
+        gpu_name = gpu.get('name') or 'GPU'
+        prefix = self.gpu_prefix(gpu)
+        # Scoped per server and GPU index so multiple hosts / multiple GPUs (even of the
+        # same model) remain distinct Home Assistant devices.
+        device_id = self.gpu_device_id(gpu)
 
         # Device information
         device_info = {
             "identifiers": [f"gpu_monitor_{device_id}"],
-            "name": f"GPU Monitor - {self.server_name} - {self.gpu_name}",
-            "model": self.gpu_name,
+            "name": f"GPU Monitor - {self.server_name} - GPU {gpu['index']} - {gpu_name}",
+            "model": gpu_name,
             "manufacturer": "NVIDIA",
             "sw_version": f"Driver {self.driver_version}, CUDA {self.cuda_version}",
             "configuration_url": "https://github.com/loryanstrant/gpu-model-monitor"
@@ -199,7 +211,7 @@ class GPUMQTTPublisher:
         sensors = [
             {
                 "name": "GPU Temperature",
-                "state_topic": f"{self.mqtt_topic_prefix}/temperature",
+                "state_topic": f"{prefix}/temperature",
                 "unit_of_measurement": "°C",
                 "device_class": "temperature",
                 "state_class": "measurement",
@@ -208,7 +220,7 @@ class GPUMQTTPublisher:
             },
             {
                 "name": "GPU Utilization",
-                "state_topic": f"{self.mqtt_topic_prefix}/utilization",
+                "state_topic": f"{prefix}/utilization",
                 "unit_of_measurement": "%",
                 "state_class": "measurement",
                 "unique_id": f"{device_id}_utilization",
@@ -216,7 +228,7 @@ class GPUMQTTPublisher:
             },
             {
                 "name": "GPU Memory Used",
-                "state_topic": f"{self.mqtt_topic_prefix}/memory",
+                "state_topic": f"{prefix}/memory",
                 "unit_of_measurement": "MiB",
                 "state_class": "measurement",
                 "unique_id": f"{device_id}_memory",
@@ -224,7 +236,7 @@ class GPUMQTTPublisher:
             },
             {
                 "name": "GPU Memory Total",
-                "state_topic": f"{self.mqtt_topic_prefix}/memory_total",
+                "state_topic": f"{prefix}/memory_total",
                 "unit_of_measurement": "MiB",
                 "state_class": "measurement",
                 "unique_id": f"{device_id}_memory_total",
@@ -232,7 +244,7 @@ class GPUMQTTPublisher:
             },
             {
                 "name": "GPU Memory Utilization",
-                "state_topic": f"{self.mqtt_topic_prefix}/memory_percent",
+                "state_topic": f"{prefix}/memory_percent",
                 "unit_of_measurement": "%",
                 "state_class": "measurement",
                 "unique_id": f"{device_id}_memory_percent",
@@ -240,7 +252,7 @@ class GPUMQTTPublisher:
             },
             {
                 "name": "GPU Power Draw",
-                "state_topic": f"{self.mqtt_topic_prefix}/power",
+                "state_topic": f"{prefix}/power",
                 "unit_of_measurement": "W",
                 "device_class": "power",
                 "state_class": "measurement",
@@ -249,23 +261,23 @@ class GPUMQTTPublisher:
             },
             {
                 "name": "GPU Process Count",
-                "state_topic": f"{self.mqtt_topic_prefix}/process_count",
+                "state_topic": f"{prefix}/process_count",
                 "state_class": "measurement",
                 "unique_id": f"{device_id}_process_count",
                 "icon": "mdi:application-cog"
             },
             {
                 "name": "GPU Active Processes",
-                "state_topic": f"{self.mqtt_topic_prefix}/active_processes",
-                "json_attributes_topic": f"{self.mqtt_topic_prefix}/active_processes",
+                "state_topic": f"{prefix}/active_processes",
+                "json_attributes_topic": f"{prefix}/active_processes",
                 "unique_id": f"{device_id}_active_processes",
                 "icon": "mdi:application-brackets",
                 "value_template": "{{ value_json.count }}"
             },
             {
                 "name": "GPU Process History",
-                "state_topic": f"{self.mqtt_topic_prefix}/process_history",
-                "json_attributes_topic": f"{self.mqtt_topic_prefix}/process_history",
+                "state_topic": f"{prefix}/process_history",
+                "json_attributes_topic": f"{prefix}/process_history",
                 "unique_id": f"{device_id}_process_history",
                 "icon": "mdi:history",
                 "value_template": "{{ value_json.total }}"
@@ -283,10 +295,8 @@ class GPUMQTTPublisher:
                 logger.debug(f"Published discovery for: {sensor['name']}")
             else:
                 logger.error(f"Failed to publish discovery for: {sensor['name']}")
-        
-        logger.info("Home Assistant discovery messages published")
     
-    def publish_active_processes(self, processes):
+    def publish_active_processes(self, gpu, processes):
         """Publish detailed information about active GPU processes"""
         if not self.connected:
             return False
@@ -347,7 +357,7 @@ class GPUMQTTPublisher:
             }
             
             # Publish to active_processes topic
-            topic = f"{self.mqtt_topic_prefix}/active_processes"
+            topic = f"{self.gpu_prefix(gpu)}/active_processes"
             self.client.publish(topic, json.dumps(payload), retain=False)
             
             logger.debug(f"Published {len(formatted_processes)} active processes")
@@ -357,21 +367,12 @@ class GPUMQTTPublisher:
             logger.error(f"Failed to publish active processes: {e}")
             return False
     
-    def publish_process_history(self):
+    def publish_process_history(self, gpu, mem_total=0):
         """Publish GPU process history from database"""
         if not self.connected:
             return False
         
         try:
-            # Get current GPU memory total for percentage calculation
-            mem_total = 0
-            try:
-                with open('/app/gpu_current_stats.json', 'r') as f:
-                    current_stats = json.load(f)
-                    mem_total = current_stats.get('memory_total', 0)
-            except:
-                logger.debug("Could not load memory_total from current stats")
-            
             # Read process history from database via script
             import subprocess
             
@@ -394,6 +395,7 @@ class GPUMQTTPublisher:
                 END as max_memory_percent,
                 sample_count
             FROM gpu_processes
+            WHERE gpu_index = {int(gpu['index'])}
             ORDER BY last_seen DESC
             LIMIT 50;'''
             
@@ -432,7 +434,7 @@ class GPUMQTTPublisher:
                 }
                 
                 # Publish to process_history topic
-                topic = f"{self.mqtt_topic_prefix}/process_history"
+                topic = f"{self.gpu_prefix(gpu)}/process_history"
                 self.client.publish(topic, json.dumps(payload), retain=False)
                 
                 logger.debug(f"Published process history with {len(formatted_history)} entries")
@@ -445,7 +447,7 @@ class GPUMQTTPublisher:
                     "history": [],
                     "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 }
-                topic = f"{self.mqtt_topic_prefix}/process_history"
+                topic = f"{self.gpu_prefix(gpu)}/process_history"
                 self.client.publish(topic, json.dumps(payload), retain=False)
                 return True
                 
@@ -454,22 +456,31 @@ class GPUMQTTPublisher:
             return False
     
     def publish_metrics(self, metrics_data):
-        """Publish GPU metrics to MQTT"""
+        """Publish metrics for every GPU in the snapshot to MQTT"""
         if not self.connected:
             logger.warning("Not connected to MQTT broker, skipping publish")
             return False
         
+        ok = True
+        for gpu in metrics_data.get('gpus', []):
+            ok = self.publish_gpu_metrics(gpu, metrics_data.get('timestamp')) and ok
+        return ok
+
+    def publish_gpu_metrics(self, gpu, timestamp):
+        """Publish GPU metrics of one GPU to MQTT"""
         try:
+            prefix = self.gpu_prefix(gpu)
+            
             # Extract metrics
-            temperature = metrics_data.get('temperature', 0)
-            utilization = metrics_data.get('utilization', 0)
-            memory = metrics_data.get('memory', 0)
-            memory_total = metrics_data.get('memory_total', 0)
-            memory_percent = metrics_data.get('memory_percent', 0)
-            power = metrics_data.get('power', 0)
+            temperature = gpu.get('temperature', 0)
+            utilization = gpu.get('utilization', 0)
+            memory = gpu.get('memory', 0)
+            memory_total = gpu.get('memory_total', 0)
+            memory_percent = gpu.get('memory_percent', 0)
+            power = gpu.get('power', 0)
             
             # Count current processes
-            current_processes = metrics_data.get('current_processes', [])
+            current_processes = gpu.get('current_processes', [])
             # Handle both JSON string and parsed list
             if isinstance(current_processes, str):
                 try:
@@ -490,34 +501,30 @@ class GPUMQTTPublisher:
             }
             
             for metric_name, value in metrics.items():
-                topic = f"{self.mqtt_topic_prefix}/{metric_name}"
+                topic = f"{prefix}/{metric_name}"
                 self.client.publish(topic, str(value), retain=False)
             
             # Publish full state as JSON
-            state_topic = f"{self.mqtt_topic_prefix}/state"
+            state_topic = f"{prefix}/state"
             state_payload = {
-                "timestamp": metrics_data.get('timestamp'),
-                "temperature": temperature,
-                "utilization": utilization,
-                "memory": memory,
-                "memory_total": memory_total,
-                "memory_percent": memory_percent,
-                "power": power,
-                "process_count": process_count
+                "timestamp": timestamp,
+                "gpu_index": gpu['index'],
+                "gpu_name": gpu.get('name'),
+                **metrics
             }
             self.client.publish(state_topic, json.dumps(state_payload), retain=False)
             
             # Publish active processes with details
-            self.publish_active_processes(current_processes)
+            self.publish_active_processes(gpu, current_processes)
             
             # Publish process history (every publish cycle to keep history updated)
-            self.publish_process_history()
+            self.publish_process_history(gpu, memory_total)
             
-            logger.debug(f"Published metrics - Temp: {temperature}°C, Util: {utilization}%, Mem: {memory}MiB, Power: {power}W, Processes: {process_count}")
+            logger.debug(f"Published GPU {gpu['index']} metrics - Temp: {temperature}°C, Util: {utilization}%, Mem: {memory}MiB, Power: {power}W, Processes: {process_count}")
             return True
             
         except Exception as e:
-            logger.error(f"Failed to publish metrics: {e}")
+            logger.error(f"Failed to publish metrics for GPU {gpu.get('index')}: {e}")
             return False
     
     def disconnect(self):
@@ -543,30 +550,34 @@ def main():
         logger.info("MQTT is disabled, exiting")
         sys.exit(0)
     
-    # Load GPU configuration
+    # Load GPU configuration (driver/CUDA versions)
     publisher.load_gpu_config()
+    
+    # Read metrics from JSON file (needed before connecting: discovery is per GPU)
+    try:
+        with open(json_file, 'r') as f:
+            metrics = json.load(f)
+    except Exception as e:
+        logger.error(f"Error reading metrics file: {e}")
+        sys.exit(1)
+    
+    publisher.gpus = metrics.get('gpus', [])
+    if not publisher.gpus:
+        logger.error("No GPUs found in metrics file")
+        sys.exit(1)
     
     # Connect to broker
     if not publisher.connect():
         logger.error("Failed to connect to MQTT broker")
         sys.exit(1)
     
-    # Read metrics from JSON file
     try:
-        with open(json_file, 'r') as f:
-            metrics = json.load(f)
-        
         # Publish metrics
         if publisher.publish_metrics(metrics):
-            logger.info("Successfully published metrics to MQTT")
+            logger.info(f"Successfully published metrics for {len(publisher.gpus)} GPU(s) to MQTT")
         else:
             logger.error("Failed to publish metrics to MQTT")
             sys.exit(1)
-    
-    except Exception as e:
-        logger.error(f"Error reading metrics file: {e}")
-        sys.exit(1)
-    
     finally:
         publisher.disconnect()
 

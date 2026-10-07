@@ -24,4 +24,4 @@ services:
       - /home/docker/GPU-Model-Monitor/history:/app/history:rw
       - /home/docker/GPU-Model-Monitor/logs:/app/logs:rw
     restart: unless-stopped
-    gpus: "all"
+    gpus: "all"  # all GPUs are monitored

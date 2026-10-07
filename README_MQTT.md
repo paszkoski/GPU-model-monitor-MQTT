@@ -28,7 +28,9 @@ The MQTT functionality is configured through environment variables in the docker
 
 When enabled, the following topics are published. The effective prefix is
 `<MQTT_TOPIC_PREFIX>/<server>` (e.g. `gpu_monitor/myserver`), so each host gets its own
-subtree and `gpu_monitor/#` still subscribes to all of them:
+subtree and `gpu_monitor/#` still subscribes to all of them. Each GPU is published under its own
+`gpu<N>` subtree (`N` = nvidia-smi index), so `{prefix}` below means
+`<MQTT_TOPIC_PREFIX>/<server>/gpu<N>`, e.g. `gpu_monitor/myserver/gpu1`:
 
 - `{prefix}/temperature` - GPU temperature in °C
 - `{prefix}/utilization` - GPU utilization percentage
@@ -44,7 +46,7 @@ subtree and `gpu_monitor/#` still subscribes to all of them:
 
 The monitor automatically publishes MQTT discovery messages for Home Assistant. Once running, sensors will appear automatically in Home Assistant under:
 
-**Device**: GPU Monitor - {Server Name} - {Your GPU Name}
+**Device** (one per GPU): GPU Monitor - {Server Name} - GPU {N} - {Your GPU Name}
 
 **Sensors**:
 - GPU Temperature
